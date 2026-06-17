@@ -1,0 +1,451 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>TRON: Adaptive Arena v1.0 by Soban Ahmed</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link href="https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap" rel="stylesheet">
+  <style>
+    body {
+      @apply bg-black overflow-hidden;
+      font-family: 'Press Start 2P', monospace;
+    }
+    canvas {
+      display: block;
+      width: 100vw;
+      height: 100vh;
+      background: radial-gradient(circle at center, #001020 0%, #000010 70%);
+    }
+    /* CRT scanline overlay */
+    .crt::before {
+      content: "";
+      position: absolute;
+      top: 0; left: 0; right: 0; bottom: 0;
+      background: repeating-linear-gradient(
+        to bottom,
+        rgba(255,255,255,0.03) 0px,
+        rgba(255,255,255,0.03) 1px,
+        transparent 2px,
+        transparent 3px
+      );
+      pointer-events: none;
+      z-index: 50;
+      animation: flicker 2s infinite;
+    }
+    @keyframes flicker {
+      0%,19%,21%,23%,25%,54%,56%,100% { opacity: 1; }
+      20%,24%,55% { opacity: 0.8; }
+    }
+    /* Neon HUD text */
+    .hud-text {
+      text-shadow: 0 0 10px #0ff, 0 0 20px #0ff;
+    }
+    /* Level Up animation */
+    @keyframes levelUpFade {
+      0% { opacity: 1; transform: scale(1); }
+      50% { opacity: 1; transform: scale(1.2); }
+      100% { opacity: 0; transform: scale(1); }
+    }
+    .level-up {
+      animation: levelUpFade 3s ease-out forwards;
+      text-shadow: 0 0 15px #0ff, 0 0 25px #0ff;
+    }
+  </style>
+</head>
+<body class="relative flex items-center justify-center crt">
+  <!-- 🎮 Game Canvas -->
+  <canvas id="tronCanvas"></canvas>
+
+  <!-- 🧠 HUD Overlay -->
+  <div id="hud" class="absolute top-4 w-full text-center text-cyan-400 text-xs sm:text-sm md:text-base hud-text">
+    <span id="playerName"></span>
+    <span id="score" class="ml-4">SCORE: 0</span>
+    <span id="level" class="ml-4">LEVEL: 1</span>
+    <span id="highScore" class="ml-4">HIGH SCORE: 0</span>
+    <span id="bestLevel" class="ml-4">BEST LEVEL: 1</span>
+  </div>
+
+  <!-- ⚡ Press Start / Game Over / Level Up Messages -->
+  <div id="overlayMessage"
+       class="absolute inset-0 flex items-center justify-center text-center text-cyan-400 text-lg sm:text-2xl md:text-4xl font-bold hud-text opacity-100">
+    PRESS START
+  </div>
+
+  <!-- 🔘 Start Button (hidden until ready) -->
+  <button id="startButton"
+          class="absolute bottom-12 mx-auto bg-transparent border border-cyan-400 text-cyan-400 px-6 py-3 text-xs sm:text-sm md:text-base rounded-md font-bold transition-all duration-300 hover:bg-cyan-400 hover:text-black animate-pulse"
+          style="left: 50%; transform: translateX(-50%);">
+    PRESS START
+  </button>
+
+  <!-- 🎧 Audio -->
+  <audio id="countdownSound" src="sounds/retro_countdown_beep.mp3" preload="auto"></audio>
+  <audio id="explosionSound" src="sounds/retro_explosion.mp3" preload="auto"></audio>
+  <audio id="humSound" src="sounds/retro_hum_loop.mp3" preload="auto" loop></audio>
+
+  <!-- 💫 Footer -->
+  <div class="absolute bottom-4 w-full text-center text-cyan-400 font-mono text-xs opacity-50 select-none">
+    ⚡ TRON: Adaptive Arena v1.0 — Created by Soban Ahmed
+  </div>
+</body>
+
+<script>
+/* ============================================================
+   ⚡ TRON: Adaptive Arena v1.4 — Shooting & True Game Over
+   ============================================================ */
+
+const canvas = document.getElementById("tronCanvas");
+const ctx = canvas.getContext("2d");
+const startButton = document.getElementById("startButton");
+const overlayMessage = document.getElementById("overlayMessage");
+const scoreText = document.getElementById("score");
+const highScoreText = document.getElementById("highScore");
+const levelText = document.getElementById("level");
+const bestLevelText = document.getElementById("bestLevel");
+const playerNameEl = document.getElementById("playerName");
+
+const countdownSound = document.getElementById("countdownSound");
+const explosionSound = document.getElementById("explosionSound");
+const humSound = document.getElementById("humSound");
+
+let playerName = localStorage.getItem("tronPlayerName") || "";
+let highScore = parseInt(localStorage.getItem("tronHighScore") || 0);
+let bestLevel = parseInt(localStorage.getItem("tronBestLevel") || 1);
+let score = 0;
+let level = 1;
+let running = false;
+let gameOver = false;
+let countdown = 3;
+let lastTime = 0;
+let aiSpawned = false;
+
+const gridSize = 40;
+const trailFadeRate = 0.006;
+const explosions = [];
+const cycles = [];
+const projectiles = [];
+let playerCycle;
+let keys = { ArrowUp:false, ArrowDown:false, ArrowLeft:false, ArrowRight:false, " ":false };
+let canShoot = true;
+
+canvas.width = window.innerWidth;
+canvas.height = window.innerHeight;
+
+// ──────────────────────────────────────────────
+function drawGrid() {
+  ctx.save();
+  ctx.strokeStyle = "rgba(0,255,255,0.1)";
+  for (let x = 0; x < canvas.width; x += gridSize) {
+    ctx.beginPath(); ctx.moveTo(x,0); ctx.lineTo(x,canvas.height); ctx.stroke();
+  }
+  for (let y = 0; y < canvas.height; y += gridSize) {
+    ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(canvas.width,y); ctx.stroke();
+  }
+  ctx.restore();
+}
+
+// ──────────────────────────────────────────────
+class LightCycle {
+  constructor(x,y,dir,color,isPlayer=false) {
+    this.x=x; this.y=y; this.dir=dir; this.color=color; this.isPlayer=isPlayer;
+    this.speed=isPlayer?3:3.2;
+    this.trail=[]; this.alive=true; this.turnCooldown=0;
+    this.aggression=0.7; this.intelligence=0.7;
+  }
+
+  move() {
+    if (!this.alive) return;
+    if (this.isPlayer) this.playerControl(); else this.aiControl();
+
+    switch(this.dir){
+      case"up":this.y-=this.speed;break;
+      case"down":this.y+=this.speed;break;
+      case"left":this.x-=this.speed;break;
+      case"right":this.x+=this.speed;break;
+    }
+
+    if(this.x<0||this.y<0||this.x>canvas.width||this.y>canvas.height){
+      this.explode();
+      if(this.isPlayer) endGame();
+      return;
+    }
+
+    this.trail.push({x:this.x,y:this.y,alpha:1});
+    for(const t of this.trail)t.alpha-=trailFadeRate;
+    this.trail=this.trail.filter(t=>t.alpha>0);
+  }
+
+  playerControl(){
+    if(keys.ArrowUp&&this.dir!=="down")this.dir="up";
+    if(keys.ArrowDown&&this.dir!=="up")this.dir="down";
+    if(keys.ArrowLeft&&this.dir!=="right")this.dir="left";
+    if(keys.ArrowRight&&this.dir!=="left")this.dir="right";
+
+    // shooting
+    if(keys[" "] && canShoot){
+      this.shoot();
+      canShoot=false;
+      setTimeout(()=>canShoot=true,400); // cooldown
+    }
+  }
+
+  shoot(){
+    const speed=6;
+    const dx=this.dir==="right"?speed:this.dir==="left"?-speed:0;
+    const dy=this.dir==="down"?speed:this.dir==="up"?-speed:0;
+    projectiles.push({x:this.x,y:this.y,dx,dy,alpha:1});
+  }
+
+  aiControl(){
+    if(this.turnCooldown>0){this.turnCooldown--;return;}
+    const dirs=["up","right","down","left"];
+    const opposite={up:"down",down:"up",left:"right",right:"left"};
+    let bestDir=this.dir,bestScore=-1e9;
+
+    for(const d of dirs){
+      if(d===opposite[this.dir])continue;
+      const score=this.evaluateDirection(d);
+      if(score>bestScore){bestScore=score;bestDir=d;}
+    }
+    if(bestDir!==this.dir){this.dir=bestDir;this.turnCooldown=10;}
+  }
+
+  evaluateDirection(dir){
+    let nx=this.x,ny=this.y,score=0;
+    const lookAhead=60;
+    for(let i=0;i<lookAhead;i++){
+      switch(dir){
+        case"up":ny-=gridSize/4;break;
+        case"down":ny+=gridSize/4;break;
+        case"left":nx-=gridSize/4;break;
+        case"right":nx+=gridSize/4;break;
+      }
+      if(nx<0||ny<0||nx>canvas.width||ny>canvas.height){score-=400;break;}
+      for(const c of cycles){
+        for(const t of c.trail){
+          if(Math.abs(nx-t.x)<4&&Math.abs(ny-t.y)<4){score-=200;}
+        }
+      }
+      score+=3;
+    }
+    const dx=playerCycle.x-this.x,dy=playerCycle.y-this.y;
+    const toward=(dir==="right"&&dx>0)||(dir==="left"&&dx<0)||(dir==="up"&&dy>0)||(dir==="down"&&dy<0);
+    if(toward)score+=50*this.aggression;
+    return score;
+  }
+
+  explode(){
+    if(!this.alive)return;
+    this.alive=false;this.trail=[];
+    for(let i=0;i<60;i++){
+      explosions.push({x:this.x,y:this.y,dx:(Math.random()-0.5)*8,dy:(Math.random()-0.5)*8,alpha:1});
+    }
+    explosionSound.currentTime=0;explosionSound.play();
+  }
+
+  drawTrail(){
+    ctx.save();
+    ctx.strokeStyle=this.color;ctx.shadowColor=this.color;ctx.shadowBlur=this.isPlayer?25:15;
+    ctx.lineWidth=this.isPlayer?3:2;ctx.beginPath();
+    if(this.trail.length>0){
+      ctx.moveTo(this.trail[0].x,this.trail[0].y);
+      for(const t of this.trail)ctx.lineTo(t.x,t.y);
+    }
+    ctx.stroke();ctx.restore();
+  }
+
+  drawHead(){
+    if(!this.alive)return;
+    ctx.save();
+    ctx.shadowBlur=20;ctx.shadowColor=this.color;ctx.fillStyle=this.color;
+    ctx.fillRect(this.x-3,this.y-3,6,6);ctx.restore();
+  }
+}
+
+// ──────────────────────────────────────────────
+function drawProjectiles(){
+  ctx.save();
+  for(const p of projectiles){
+    ctx.fillStyle="white";
+    ctx.shadowColor="white";
+    ctx.shadowBlur=15;
+    ctx.globalAlpha=p.alpha;
+    ctx.fillRect(p.x-2,p.y-2,4,4);
+    p.x+=p.dx; p.y+=p.dy;
+    if(p.x<0||p.y<0||p.x>canvas.width||p.y>canvas.height)p.alpha=0;
+  }
+  ctx.restore();
+  for(let i=projectiles.length-1;i>=0;i--)if(projectiles[i].alpha<=0)projectiles.splice(i,1);
+}
+
+// ──────────────────────────────────────────────
+function detectProjectileHits(){
+  for(const p of projectiles){
+    for(const c of cycles){
+      if(c.isPlayer||!c.alive)continue;
+      if(Math.abs(p.x-c.x)<8&&Math.abs(p.y-c.y)<8){
+        c.explode();
+        p.alpha=0;
+        score+=150; // bonus points for hit
+      }
+    }
+  }
+}
+
+// ──────────────────────────────────────────────
+function detectCollisions(){
+  const allTrails=[];
+  for(const c of cycles)for(const t of c.trail)allTrails.push({x:t.x,y:t.y,owner:c});
+  for(const c of cycles){
+    if(!c.alive)continue;
+    for(const t of allTrails){
+      if(t.owner===c)continue;
+      if(Math.abs(c.x-t.x)<3&&Math.abs(c.y-t.y)<3){
+        c.explode();
+        if(c.isPlayer) endGame();
+      }
+    }
+  }
+}
+
+function drawExplosions(){
+  for(const e of explosions){
+    ctx.save();ctx.globalAlpha=e.alpha;ctx.fillStyle="#fff";ctx.shadowColor="#fff";
+    ctx.shadowBlur=20;ctx.fillRect(e.x,e.y,3,3);ctx.restore();
+    e.x+=e.dx;e.y+=e.dy;e.alpha-=0.02;
+  }
+  for(let i=explosions.length-1;i>=0;i--)if(explosions[i].alpha<=0)explosions.splice(i,1);
+}
+
+// ──────────────────────────────────────────────
+function initGame(){
+  cycles.length=0;explosions.length=0;projectiles.length=0;
+  score=0;level=1;gameOver=false;running=false;aiSpawned=false;
+  playerCycle=new LightCycle(canvas.width/2,canvas.height-100,"up","#ff8000",true);
+  cycles.push(playerCycle);
+  overlayMessage.textContent="";
+  updateHUD();
+}
+
+// ──────────────────────────────────────────────
+function spawnAI(){
+  const sides=["top","bottom","left","right"];
+  const side=sides[Math.floor(Math.random()*4)];
+  let x,y,dir;const m=60;
+  switch(side){
+    case"top":x=Math.random()*(canvas.width-120)+60;y=m;dir="down";break;
+    case"bottom":x=Math.random()*(canvas.width-120)+60;y=canvas.height-m;dir="up";break;
+    case"left":x=m;y=Math.random()*(canvas.height-120)+60;dir="right";break;
+    case"right":x=canvas.width-m;y=Math.random()*(canvas.height-120)+60;dir="left";break;
+  }
+  const cols=["#ff0000","#ffff00","#00bfff","#ff00ff"];
+  const ai=new LightCycle(x,y,dir,cols[Math.floor(Math.random()*cols.length)]);
+  ai.speed=3+(level*0.25);
+  ai.aggression=0.7+Math.min(0.3,level*0.03);
+  cycles.push(ai);
+}
+
+// ──────────────────────────────────────────────
+function spawnLevelAI(){
+  const num=Math.min(4+level,8);
+  for(let i=0;i<num;i++)spawnAI(i);
+  aiSpawned=true;
+}
+
+// ──────────────────────────────────────────────
+function levelUp(){
+  aiSpawned=false;
+  level++;
+  overlayMessage.textContent="LEVEL "+level;
+  overlayMessage.classList.add("level-up");
+  setTimeout(()=>{overlayMessage.textContent="";overlayMessage.classList.remove("level-up");},2000);
+  cycles.forEach(c=>{if(!c.isPlayer)c.trail=[];});
+}
+
+// ──────────────────────────────────────────────
+function updateHUD(){
+  playerNameEl.textContent=playerName?`1UP ${playerName}`:"1UP";
+  scoreText.textContent=`SCORE: ${score}`;
+  highScoreText.textContent=`HIGH SCORE: ${highScore}`;
+  levelText.textContent=`LEVEL: ${level}`;
+  bestLevelText.textContent=`BEST LEVEL: ${bestLevel}`;
+}
+
+// ──────────────────────────────────────────────
+function endGame(){
+  if(gameOver)return;
+  gameOver=true;running=false;
+  humSound.pause();
+  overlayMessage.innerHTML=`GAME OVER<br>LEVEL ${level}<br>SCORE ${score}<br>PRESS START`;
+  startButton.style.display="block";
+  if(score>highScore){highScore=score;localStorage.setItem("tronHighScore",highScore);}
+  if(level>bestLevel){bestLevel=level;localStorage.setItem("tronBestLevel",bestLevel);}
+}
+
+// ──────────────────────────────────────────────
+function animate(timestamp){
+  const delta=(timestamp-lastTime)/1000;lastTime=timestamp;
+  if(!running)return;
+
+  ctx.fillStyle="rgba(0,0,20,0.25)";
+  ctx.fillRect(0,0,canvas.width,canvas.height);
+  drawGrid();
+
+  for(const c of cycles){c.move();c.drawTrail();c.drawHead();}
+  drawProjectiles();
+  detectProjectileHits();
+  detectCollisions();
+  drawExplosions();
+
+  score+=Math.floor(delta*10);
+  updateHUD();
+
+  const currentAIs=cycles.filter(c=>!c.isPlayer&&c.alive);
+  if(!aiSpawned&&!gameOver)spawnLevelAI();
+
+  if(!gameOver&&aiSpawned&&currentAIs.length===0&&(!animate.levelLock||performance.now()-animate.levelLock>4000)){
+    animate.levelLock=performance.now();
+    levelUp();
+  }
+
+  if(!gameOver) requestAnimationFrame(animate);
+}
+
+// ──────────────────────────────────────────────
+function startGame(){
+  if(!playerName){
+    playerName=prompt("ENTER YOUR NAME")||"PLAYER";
+    localStorage.setItem("tronPlayerName",playerName);
+  }
+  initGame();
+  startButton.style.display="none";
+  overlayMessage.textContent="3";
+  countdown=3;countdownSound.play();
+
+  const countdownInterval=setInterval(()=>{
+    countdown--;
+    if(countdown>0){
+      overlayMessage.textContent=countdown;
+      countdownSound.currentTime=0;countdownSound.play();
+    }else{
+      clearInterval(countdownInterval);
+      overlayMessage.textContent="";
+      running=true;
+      humSound.currentTime=0;humSound.play();
+      lastTime=performance.now();
+      spawnLevelAI();
+      requestAnimationFrame(animate);
+    }
+  },1000);
+}
+
+// ──────────────────────────────────────────────
+startButton.addEventListener("click",startGame);
+window.addEventListener("keydown",e=>{ if(keys.hasOwnProperty(e.key)) keys[e.key]=true; });
+window.addEventListener("keyup",e=>{ if(keys.hasOwnProperty(e.key)) keys[e.key]=false; });
+updateHUD();
+</script>
+
+
+</html>
